@@ -26,6 +26,12 @@ The plugin registers the following custom tools:
 - `memory_list`
 - `memory_stats`
 
+Default behavior: memory is isolated by project path. The plugin derives a
+stable `project:<path-hash>` scope from current worktree, checks it on startup,
+and creates it automatically when missing.
+
+Only when user explicitly provides `scope` does it use another scope.
+
 ## Install modes
 
 ### 1) Project-local mode

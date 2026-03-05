@@ -1,5 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin";
@@ -42,6 +43,7 @@ interface Runtime {
   retriever: ReturnType<typeof createRetriever>;
   scopeManager: ReturnType<typeof createScopeManager>;
   embedder: ReturnType<typeof createEmbedder>;
+  projectScope: string;
 }
 
 function toRecord(value: unknown): Record<string, unknown> | undefined {
@@ -106,6 +108,47 @@ function resolvePathFromWorktree(worktree: string, pathValue: string): string {
   const expanded = expandHomePath(pathValue);
   if (isAbsolute(expanded)) return expanded;
   return resolve(worktree, expanded);
+}
+
+function createProjectScopeFromPath(worktree: string): string {
+  const normalized = resolve(worktree).replace(/\\/g, "/");
+  const slug = normalized
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(-48) || "project";
+  const digest = createHash("sha1").update(normalized).digest("hex").slice(0, 10);
+  return `project:${slug}:${digest}`;
+}
+
+function withProjectScope(
+  scopes: Partial<ScopeConfig> | undefined,
+  projectScope: string,
+  worktree: string,
+): Partial<ScopeConfig> {
+  const definitions = {
+    ...(scopes?.definitions ?? {}),
+  };
+
+  if (!definitions[projectScope]) {
+    definitions[projectScope] = {
+      description: `Project-scoped memory for ${worktree}`,
+      metadata: {
+        worktree,
+      },
+    };
+  }
+
+  return {
+    ...scopes,
+    definitions,
+  };
+}
+
+function ensureScopeDefinition(runtime: Runtime, scope: string, description: string): void {
+  if (runtime.scopeManager.getScopeDefinition(scope)) {
+    return;
+  }
+  runtime.scopeManager.addScopeDefinition(scope, { description });
 }
 
 function looksLikeMemoryId(value: string): boolean {
@@ -257,6 +300,7 @@ async function appLog(
 async function buildRuntime(ctx: PluginInput): Promise<Runtime> {
   const rawConfig = await loadRawConfig(ctx.worktree);
   const config = parsePluginConfig(rawConfig, ctx.worktree);
+  const projectScope = createProjectScopeFromPath(ctx.worktree);
 
   validateStoragePath(config.dbPath);
 
@@ -284,12 +328,15 @@ async function buildRuntime(ctx: PluginInput): Promise<Runtime> {
     ...config.retrieval,
   });
 
-  const scopeManager = createScopeManager(config.scopes);
+  const scopeManager = createScopeManager(
+    withProjectScope(config.scopes, projectScope, ctx.worktree),
+  );
 
   await appLog(ctx, "info", "plugin runtime initialized", {
     dbPath: config.dbPath,
     embeddingModel: config.embedding.model,
     retrievalMode: retriever.getConfig().mode,
+    projectScope,
   });
 
   return {
@@ -298,6 +345,7 @@ async function buildRuntime(ctx: PluginInput): Promise<Runtime> {
     retriever,
     scopeManager,
     embedder,
+    projectScope,
   };
 }
 
@@ -311,17 +359,17 @@ function ensureCategory(value?: string): MemoryCategory | undefined {
 
 function resolveScopeFilter(
   runtime: Runtime,
-  agentId: string,
+  _agentId: string,
   requestedScope?: string,
 ): { scopeFilter?: string[]; error?: string } {
-  const scopeManager = runtime.scopeManager;
   if (requestedScope) {
-    if (!scopeManager.isAccessible(requestedScope, agentId)) {
-      return { error: `Access denied to scope: ${requestedScope}` };
+    if (!runtime.scopeManager.validateScope(requestedScope)) {
+      return { error: `Invalid scope: ${requestedScope}` };
     }
+    ensureScopeDefinition(runtime, requestedScope, `Auto-created scope: ${requestedScope}`);
     return { scopeFilter: [requestedScope] };
   }
-  return { scopeFilter: scopeManager.getAccessibleScopes(agentId) };
+  return { scopeFilter: [runtime.projectScope] };
 }
 
 function requireManagement(runtime: Runtime): string | null {
@@ -423,13 +471,14 @@ export const MemoryLanceDBProPlugin: Plugin = async (ctx) => {
         },
         async execute(args, toolCtx) {
           const runtime = await getRuntime();
-          const agentId = toolCtx.agent || "main";
 
           const targetScope =
-            args.scope || runtime.scopeManager.getDefaultScope(agentId);
-          if (!runtime.scopeManager.isAccessible(targetScope, agentId)) {
-            return `Access denied to scope: ${targetScope}`;
+            args.scope || runtime.projectScope;
+          if (!runtime.scopeManager.validateScope(targetScope)) {
+            return `Invalid scope: ${targetScope}`;
           }
+
+          ensureScopeDefinition(runtime, targetScope, `Auto-created scope: ${targetScope}`);
 
           if (isNoise(args.text)) {
             return "Skipped: text detected as noise (greetings/meta/boilerplate).";
@@ -532,6 +581,10 @@ export const MemoryLanceDBProPlugin: Plugin = async (ctx) => {
             .string()
             .min(1)
             .describe("Memory ID or search text"),
+          scope: tool.schema
+            .string()
+            .optional()
+            .describe("Optional scope filter for target memory"),
           text: tool.schema
             .string()
             .optional()
@@ -550,7 +603,12 @@ export const MemoryLanceDBProPlugin: Plugin = async (ctx) => {
         async execute(args, toolCtx) {
           const runtime = await getRuntime();
           const agentId = toolCtx.agent || "main";
-          const scopeFilter = runtime.scopeManager.getAccessibleScopes(agentId);
+          const { scopeFilter, error } = resolveScopeFilter(
+            runtime,
+            agentId,
+            args.scope,
+          );
+          if (error || !scopeFilter) return error || "Invalid scope";
 
           if (
             args.text === undefined &&
@@ -727,6 +785,19 @@ export const MemoryLanceDBProPlugin: Plugin = async (ctx) => {
 
     event: async ({ event }) => {
       if (event.type === "server.connected") {
+        try {
+          const runtime = await getRuntime();
+          await appLog(ctx, "info", "project scope ready", {
+            projectScope: runtime.projectScope,
+            worktree: ctx.worktree,
+          });
+        } catch (error) {
+          await appLog(ctx, "error", "project scope init failed", {
+            error: String(error),
+            worktree: ctx.worktree,
+          });
+        }
+
         await appLog(ctx, "info", "plugin loaded", {
           directory: ctx.directory,
           worktree: ctx.worktree,

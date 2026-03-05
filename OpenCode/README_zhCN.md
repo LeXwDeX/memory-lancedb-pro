@@ -25,6 +25,11 @@
 - `memory_list`
 - `memory_stats`
 
+默认行为：按项目路径隔离记忆。插件会基于当前 worktree 生成稳定的
+`project:<path-hash>` scope，在启动时检查该 scope，不存在则自动创建。
+
+仅当用户显式传入 `scope` 参数时，才会切换到其他 scope。
+
 ## 安装模式
 
 ### 1）项目内模式
