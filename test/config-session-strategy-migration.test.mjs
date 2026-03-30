@@ -48,8 +48,19 @@ describe("sessionStrategy legacy compatibility mapping", () => {
     assert.equal(parsed.sessionStrategy, "memoryReflection");
   });
 
-  it("defaults to systemSessionMemory when neither field is set", () => {
+  it("defaults to none when neither field is set", () => {
     const parsed = parsePluginConfig(baseConfig());
-    assert.equal(parsed.sessionStrategy, "systemSessionMemory");
+    assert.equal(parsed.sessionStrategy, "none");
+  });
+
+  it("preserves embedding.chunking when explicitly configured", () => {
+    const parsed = parsePluginConfig({
+      ...baseConfig(),
+      embedding: {
+        ...baseConfig().embedding,
+        chunking: false,
+      },
+    });
+    assert.equal(parsed.embedding.chunking, false);
   });
 });

@@ -17,16 +17,62 @@ import { spawn } from "node:child_process";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
-import { ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
+import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
-import { AccessTracker } from "./src/access-tracker.js";
+import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.js";
+import {
+  runCompaction,
+  shouldRunCompaction,
+  recordCompactionRun,
+  type CompactionConfig,
+} from "./src/memory-compactor.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
+import {
+  storeReflectionToLanceDB,
+  loadAgentReflectionSlicesFromEntries,
+  DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+} from "./src/reflection-store.js";
+import {
+  extractReflectionLearningGovernanceCandidates,
+  extractInjectableReflectionMappedMemoryItems,
+} from "./src/reflection-slices.js";
+import { createReflectionEventId } from "./src/reflection-event-store.js";
+import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
+import { isNoise } from "./src/noise-filter.js";
+import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+
+// Import smart extraction & lifecycle components
+import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
+import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
+import { NoisePrototypeBank } from "./src/noise-prototypes.js";
+import { createLlmClient } from "./src/llm-client.js";
+import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
+import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
+import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import {
+  buildSmartMetadata,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+  toLifecycleMemory,
+} from "./src/smart-metadata.js";
+import {
+  filterUserMdExclusiveRecallResults,
+  isUserMdExclusiveMemory,
+  type WorkspaceBoundaryConfig,
+} from "./src/workspace-boundary.js";
+import {
+  normalizeAdmissionControlConfig,
+  resolveRejectedAuditFilePath,
+  type AdmissionControlConfig,
+  type AdmissionRejectionAuditEntry,
+} from "./src/admission-control.js";
+import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 
 // ============================================================================
 // Configuration & Types
@@ -35,19 +81,28 @@ import { createMemoryCLI } from "./cli.js";
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey: string | string[];
     model?: string;
     baseURL?: string;
     dimensions?: number;
+    omitDimensions?: boolean;
     taskQuery?: string;
     taskPassage?: string;
     normalized?: boolean;
+    chunking?: boolean;
   };
   dbPath?: string;
   autoCapture?: boolean;
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  autoRecallTimeoutMs?: number;
+  autoRecallMaxItems?: number;
+  autoRecallMaxChars?: number;
+  autoRecallPerItemMaxChars?: number;
+  /** Hard per-turn injection cap (safety valve). Overrides autoRecallMaxItems if lower. Default: 10. */
+  maxRecallPerTurn?: number;
+  recallMode?: "full" | "summary" | "adaptive" | "off";
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -59,7 +114,13 @@ interface PluginConfig {
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
-    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
+    rerankProvider?:
+      | "jina"
+      | "siliconflow"
+      | "voyage"
+      | "pinecone"
+      | "dashscope"
+      | "tei";
     recencyHalfLifeDays?: number;
     recencyWeight?: number;
     filterNoise?: boolean;
@@ -69,6 +130,43 @@ interface PluginConfig {
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
   };
+  decay?: {
+    recencyHalfLifeDays?: number;
+    recencyWeight?: number;
+    frequencyWeight?: number;
+    intrinsicWeight?: number;
+    staleThreshold?: number;
+    searchBoostMin?: number;
+    importanceModulation?: number;
+    betaCore?: number;
+    betaWorking?: number;
+    betaPeripheral?: number;
+    coreDecayFloor?: number;
+    workingDecayFloor?: number;
+    peripheralDecayFloor?: number;
+  };
+  tier?: {
+    coreAccessThreshold?: number;
+    coreCompositeThreshold?: number;
+    coreImportanceThreshold?: number;
+    peripheralCompositeThreshold?: number;
+    peripheralAgeDays?: number;
+    workingAccessThreshold?: number;
+    workingCompositeThreshold?: number;
+  };
+  // Smart extraction config
+  smartExtraction?: boolean;
+  llm?: {
+    auth?: "api-key" | "oauth";
+    apiKey?: string;
+    model?: string;
+    baseURL?: string;
+    oauthProvider?: string;
+    oauthPath?: string;
+    timeoutMs?: number;
+  };
+  extractMinMessages?: number;
+  extractMaxChars?: number;
   scopes?: {
     default?: string;
     definitions?: Record<string, { description: string }>;
@@ -86,6 +184,7 @@ interface PluginConfig {
   memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
+    writeLegacyCombined?: boolean;
     injectMode?: ReflectionInjectMode;
     agentId?: string;
     messageCount?: number;
@@ -96,6 +195,24 @@ interface PluginConfig {
     dedupeErrorSignals?: boolean;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
+  workspaceBoundary?: WorkspaceBoundaryConfig;
+  admissionControl?: AdmissionControlConfig;
+  memoryCompaction?: {
+    enabled?: boolean;
+    minAgeDays?: number;
+    similarityThreshold?: number;
+    minClusterSize?: number;
+    maxMemoriesToScan?: number;
+    cooldownHours?: number;
+  };
+  sessionCompression?: {
+    enabled?: boolean;
+    minScoreToKeep?: number;
+  };
+  extractionThrottle?: {
+    skipLowValue?: boolean;
+    maxExtractionsPerHour?: number;
+  };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -131,6 +248,23 @@ function resolveEnvVars(value: string): string {
   });
 }
 
+function resolveFirstApiKey(apiKey: string | string[]): string {
+  const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
+  if (!key) {
+    throw new Error("embedding.apiKey is empty");
+  }
+  return resolveEnvVars(key);
+}
+
+function resolveOptionalPathWithEnv(
+  api: Pick<OpenClawPluginApi, "resolvePath">,
+  value: string | undefined,
+  fallback: string,
+): string {
+  const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+  return api.resolvePath(resolveEnvVars(raw));
+}
+
 function parsePositiveInt(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
     return Math.floor(value);
@@ -145,6 +279,75 @@ function parsePositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function resolveLlmTimeoutMs(config: PluginConfig): number {
+  return parsePositiveInt(config.llm?.timeoutMs) ?? 30000;
+}
+
+function resolveHookAgentId(
+  explicitAgentId: string | undefined,
+  sessionKey: string | undefined,
+): string {
+  const trimmedExplicit = explicitAgentId?.trim();
+  return (trimmedExplicit && trimmedExplicit.length > 0
+    ? trimmedExplicit
+    : parseAgentIdFromSessionKey(sessionKey)) || "main";
+}
+
+function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
+  const trimmed = sessionKey?.trim() ?? "";
+  const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
+  const source = match?.[1]?.trim();
+  return source || "unknown";
+}
+
+function summarizeAgentEndMessages(messages: unknown[]): string {
+  const roleCounts = new Map<string, number>();
+  let textBlocks = 0;
+  let stringContents = 0;
+  let arrayContents = 0;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const msgObj = msg as Record<string, unknown>;
+    const role =
+      typeof msgObj.role === "string" && msgObj.role.trim().length > 0
+        ? msgObj.role
+        : "unknown";
+    roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
+
+    const content = msgObj.content;
+    if (typeof content === "string") {
+      stringContents++;
+      continue;
+    }
+    if (Array.isArray(content)) {
+      arrayContents++;
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          (block as Record<string, unknown>).type === "text" &&
+          typeof (block as Record<string, unknown>).text === "string"
+        ) {
+          textBlocks++;
+        }
+      }
+    }
+  }
+
+  const roles =
+    Array.from(roleCounts.entries())
+      .map(([role, count]) => `${role}:${count}`)
+      .join(", ") || "none";
+
+  return `messages=${messages.length}, roles=[${roles}], stringContents=${stringContents}, arrayContents=${arrayContents}, textBlocks=${textBlocks}`;
+}
+
 const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
 
 After completing tasks, evaluate if any learnings should be captured:
@@ -152,7 +355,6 @@ After completing tasks, evaluate if any learnings should be captured:
 **Log when:**
 - User corrects you -> .learnings/LEARNINGS.md
 - Command/operation fails -> .learnings/ERRORS.md
-- User wants missing capability -> .learnings/FEATURE_REQUESTS.md
 - You discover your knowledge was wrong -> .learnings/LEARNINGS.md
 - You find a better approach -> .learnings/LEARNINGS.md
 
@@ -173,8 +375,8 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
-const DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
+const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
 type ReflectionErrorSignal = {
   at: number;
@@ -204,7 +406,6 @@ function toImportSpecifier(value: string): string {
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
   return trimmed;
 }
-
 function getExtensionApiImportSpecifiers(): string[] {
   const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
   const specifiers: string[] = [];
@@ -220,6 +421,7 @@ function getExtensionApiImportSpecifiers(): string[] {
 
   specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
+  specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
 
   return [...new Set(specifiers.filter(Boolean))];
 }
@@ -258,6 +460,25 @@ function clipDiagnostic(text: string, maxLen = 400): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxLen) return oneLine;
   return `${oneLine.slice(0, maxLen - 3)}...`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
 }
 
 function tryParseJsonObject(raw: string): Record<string, unknown> | null {
@@ -414,13 +635,6 @@ async function loadSelfImprovementReminderContent(workspaceDir?: string): Promis
   }
 }
 
-function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
-  const sk = (sessionKey ?? "").trim();
-  const parts = sk.split(":");
-  if (parts.length >= 2 && parts[0] === "agent" && parts[1]) return parts[1];
-  return undefined;
-}
-
 function resolveAgentPrimaryModelRef(cfg: unknown, agentId: string): string | undefined {
   try {
     const root = cfg as Record<string, unknown>;
@@ -499,6 +713,11 @@ function extractTextContent(content: unknown): string | null {
   return null;
 }
 
+/**
+ * Check if a message should be skipped (slash commands, injected recall/system blocks).
+ * Used by both the **reflection** pipeline (session JSONL reading) and the
+ * **auto-capture** pipeline (via `normalizeAutoCaptureText`) as a final guard.
+ */
 function shouldSkipReflectionMessage(role: string, text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
@@ -515,6 +734,53 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
   }
 
   return false;
+}
+
+const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
+const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
+  /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
+
+/**
+ * Prune a Map to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) keys when over the limit.
+ */
+function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
+  if (map.size <= maxEntries) return;
+  const excess = map.size - maxEntries;
+  const iter = map.keys();
+  for (let i = 0; i < excess; i++) {
+    const key = iter.next().value;
+    if (key !== undefined) map.delete(key);
+  }
+}
+
+function isExplicitRememberCommand(text: string): boolean {
+  return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
+}
+
+function buildAutoCaptureConversationKeyFromIngress(
+  channelId: string | undefined,
+  conversationId: string | undefined,
+): string | null {
+  const channel = typeof channelId === "string" ? channelId.trim() : "";
+  const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
+  if (!channel || !conversation) return null;
+  return `${channel}:${conversation}`;
+}
+
+/**
+ * Extract the conversation portion from a sessionKey.
+ * Expected format: `agent:<agentId>:<channelId>:<conversationId>`
+ * where `<agentId>` does not contain colons. Returns everything after
+ * the second colon as the conversation key, or null if the format
+ * does not match.
+ */
+function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): string | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed) return null;
+  const match = /^agent:[^:]+:(.+)$/.exec(trimmed);
+  const suffix = match?.[1]?.trim();
+  return suffix || null;
 }
 
 function redactSecrets(text: string): string {
@@ -604,31 +870,48 @@ function extractTextFromToolResult(result: unknown): string {
   }
 }
 
+function summarizeRecentConversationMessages(
+  messages: readonly unknown[],
+  messageCount: number,
+): string | null {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  const recent: string[] = [];
+  for (let index = messages.length - 1; index >= 0 && recent.length < messageCount; index--) {
+    const raw = messages[index];
+    if (!raw || typeof raw !== "object") continue;
+
+    const msg = raw as Record<string, unknown>;
+    const role = typeof msg.role === "string" ? msg.role : "";
+    if (role !== "user" && role !== "assistant") continue;
+
+    const text = extractTextContent(msg.content);
+    if (!text || shouldSkipReflectionMessage(role, text)) continue;
+
+    recent.push(`${role}: ${redactSecrets(text)}`);
+  }
+
+  if (recent.length === 0) return null;
+  recent.reverse();
+  return recent.join("\n");
+}
+
 async function readSessionConversationForReflection(filePath: string, messageCount: number): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
-    const messages: string[] = [];
+    const messages: unknown[] = [];
 
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
         if (entry?.type !== "message" || !entry?.message) continue;
-
-        const msg = entry.message as Record<string, unknown>;
-        const role = typeof msg.role === "string" ? msg.role : "";
-        if (role !== "user" && role !== "assistant") continue;
-
-        const text = extractTextContent(msg.content);
-        if (!text || shouldSkipReflectionMessage(role, text)) continue;
-
-        messages.push(`${role}: ${redactSecrets(text)}`);
+        messages.push(entry.message);
       } catch {
         // ignore JSON parse errors
       }
     }
 
-    if (messages.length === 0) return null;
-    return messages.slice(-messageCount).join("\n");
+    return summarizeRecentConversationMessages(messages, messageCount);
   } catch {
     return null;
   }
@@ -678,19 +961,11 @@ function buildReflectionPrompt(
     : "- (none)";
   return [
     "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
-    "Align with a self-improvement workflow: governance -> distill -> promote.",
     "",
-    "Goal: extract high-signal knowledge and reflection material. Do NOT paste raw transcript.",
-    "Write ONLY Markdown. Be concise but information-dense.",
+    "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
-    "Hard rules:",
-    "- Do NOT copy long quotes from the conversation.",
-    "- Extract decisions, preferences, lessons, pitfalls, and next actions.",
-    "- If any secret/token/password appears, keep it as [REDACTED] (never reconstruct).",
-    "- If there were tool failures, turn them into actionable learning/error candidates.",
-    "",
-    "Output sections (use these exact headings):",
-    "## Context",
+    "Use these headings exactly once, in this exact order, with exact spelling:",
+    "## Context (session background)",
     "## Decisions (durable)",
     "## User model deltas (about the human)",
     "## Agent model deltas (about the assistant/system)",
@@ -701,25 +976,90 @@ function buildReflectionPrompt(
     "## Invariants",
     "## Derived",
     "",
-    "Guidance for the final two sections (keep them short):",
-    "- Invariants = stable cross-session rules only. Each bullet must read like a rule/policy, not a diary note.",
-    "- Write invariants in executable rule form, such as: Always / Never / When X, do Y / Prefer / Avoid / Require.",
-    "- Do NOT put one-off observations, temporary follow-ups, or vague reflections in Invariants.",
-    "- Derived = latest-run deltas only. Keep only changes exposed by THIS run that should influence the NEXT run.",
-    "- Write derived bullets as concrete next-run adjustments, such as: This run showed ... / Next run ... / Re-check ... / Avoid repeating ...",
-    "- Do NOT restate long-term rules in Derived.",
+    "Hard rules:",
+    "- Do not rename, translate, merge, reorder, or omit headings.",
+    "- Every section must appear exactly once.",
+    "- For bullet sections, use one item per line, starting with '- '.",
+    "- Do not wrap one bullet across multiple lines.",
+    "- If a bullet section is empty, write exactly: '- (none captured)'",
+    "- Do not paste raw transcript.",
+    "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
+    "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
-    "For 'Learning governance candidates', prefer this structure:",
-    "- LRN candidate(s): correction / best_practice / knowledge_gap",
-    "- ERR candidate(s): reproducible failure signature + fix",
-    "- FEAT candidate(s): missing capability request",
-    "- Promotion candidates: AGENTS.md / SOUL.md / TOOLS.md concise rules",
-    "- Skill extraction candidate: name + why reusable + source learning id placeholder",
+    "Section rules:",
+    "- Context / Decisions / User model / Agent model / Open loops / Retrieval tags / Invariants / Derived = bullet lists only.",
+    "- Lessons & pitfalls = bullet list only; each bullet must be one single line in this shape:",
+    "  - Symptom: ... Cause: ... Fix: ... Prevention: ...",
+    "- Invariants = stable cross-session rules only; prefer bullets starting with Always / Never / When / If / Before / After / Prefer / Avoid / Require.",
+    "- Derived = recent-run distilled learnings, adjustments, and follow-up heuristics that may help the next several runs, but should decay over time.",
+    "- Keep Invariants stable and long-lived; keep Derived recent, reusable across near-term runs, and decayable.",
+    "- Do not restate long-term rules in Derived.",
     "",
-    "Recent tool error signals (PostToolUse-style detector):",
+    "Governance section rules:",
+    "- If empty, write exactly:",
+    "  - (none captured)",
+    "- Otherwise, do NOT use bullet lists there.",
+    "- Use one or more entries in exactly this format:",
+    "",
+    "### Entry 1",
+    "**Priority**: low|medium|high|critical",
+    "**Status**: pending|triage|promoted_to_skill|done",
+    "**Area**: frontend|backend|infra|tests|docs|config|<custom area>",
+    "### Summary",
+    "<one concise candidate>",
+    "### Details",
+    "<short supporting details>",
+    "### Suggested Action",
+    "<one concrete next action>",
+    "",
+    "Notes:",
+    "- Keep writer-owned metadata out of the output. The writer generates Logged and IDs.",
+    "- Prefer structured, machine-parseable output over elegant prose.",
+    "",
+    "OUTPUT TEMPLATE (copy this structure exactly):",
+    "## Context (session background)",
+    "- ...",
+    "",
+    "## Decisions (durable)",
+    "- ...",
+    "",
+    "## User model deltas (about the human)",
+    "- ...",
+    "",
+    "## Agent model deltas (about the assistant/system)",
+    "- ...",
+    "",
+    "## Lessons & pitfalls (symptom / cause / fix / prevention)",
+    "- Symptom: ... Cause: ... Fix: ... Prevention: ...",
+    "",
+    "## Learning governance candidates (.learnings / promotion / skill extraction)",
+    "### Entry 1",
+    "**Priority**: medium",
+    "**Status**: pending",
+    "**Area**: config",
+    "### Summary",
+    "...",
+    "### Details",
+    "...",
+    "### Suggested Action",
+    "...",
+    "",
+    "## Open loops / next actions",
+    "- ...",
+    "",
+    "## Retrieval tags / keywords",
+    "- ...",
+    "",
+    "## Invariants",
+    "- Always ...",
+    "",
+    "## Derived",
+    "- This run showed ...",
+    "",
+    "Recent tool error signals:",
     errorHints,
     "",
-    "INPUT (cleaned recent conversation; role-prefixed):",
+    "INPUT:",
     "```",
     clipped,
     "```",
@@ -728,7 +1068,7 @@ function buildReflectionPrompt(
 
 function buildReflectionFallbackText(): string {
   return [
-    "## Context",
+    "## Context (session background)",
     `- ${REFLECTION_FALLBACK_MARKER}`,
     "",
     "## Decisions (durable)",
@@ -744,7 +1084,16 @@ function buildReflectionFallbackText(): string {
     "- (none captured)",
     "",
     "## Learning governance candidates (.learnings / promotion / skill extraction)",
-    "- ERR candidate: investigate last failed tool execution and log to .learnings/ERRORS.md",
+    "### Entry 1",
+    "**Priority**: medium",
+    "**Status**: triage",
+    "**Area**: config",
+    "### Summary",
+    "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
+    "### Details",
+    "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
+    "### Suggested Action",
+    "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
     "",
     "## Open loops / next actions",
     "- Investigate why embedded reflection generation failed.",
@@ -799,24 +1148,29 @@ async function generateReflectionText(params: {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
         const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
+        const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
-        return await runEmbeddedPiAgent({
-          sessionId: `reflection-${Date.now()}`,
-          sessionKey: "temp:memory-reflection",
-          agentId: params.agentId,
-          sessionFile: tempSessionFile,
-          workspaceDir: params.workspaceDir,
-          config: params.cfg,
-          prompt,
-          disableTools: true,
-          disableMessageTool: true,
-          timeoutMs: params.timeoutMs,
-          runId: `memory-reflection-${Date.now()}`,
-          bootstrapContextMode: "lightweight",
-          thinkLevel: params.thinkLevel,
-          provider,
-          model,
-        });
+        return await withTimeout(
+          runEmbeddedPiAgent({
+            sessionId: `reflection-${Date.now()}`,
+            sessionKey: "temp:memory-reflection",
+            agentId: params.agentId,
+            sessionFile: tempSessionFile,
+            workspaceDir: params.workspaceDir,
+            config: params.cfg,
+            prompt,
+            disableTools: true,
+            disableMessageTool: true,
+            timeoutMs: params.timeoutMs,
+            runId: `memory-reflection-${Date.now()}`,
+            bootstrapContextMode: "lightweight",
+            thinkLevel: params.thinkLevel,
+            provider,
+            model,
+          }),
+          embeddedTimeoutMs,
+          "embedded reflection run"
+        );
       },
     });
 
@@ -1000,6 +1354,39 @@ function sanitizeForContext(text: string): string {
     .slice(0, 300);
 }
 
+function summarizeTextPreview(text: string, maxLen = 120): string {
+  return JSON.stringify(sanitizeForContext(text).slice(0, maxLen));
+}
+
+function summarizeMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return `string(len=${trimmed.length}, preview=${summarizeTextPreview(trimmed)})`;
+  }
+  if (Array.isArray(content)) {
+    const textBlocks: string[] = [];
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as Record<string, unknown>).type === "text" &&
+        typeof (block as Record<string, unknown>).text === "string"
+      ) {
+        textBlocks.push((block as Record<string, unknown>).text as string);
+      }
+    }
+    const combined = textBlocks.join(" ").trim();
+    return `array(blocks=${content.length}, textBlocks=${textBlocks.length}, textLen=${combined.length}, preview=${summarizeTextPreview(combined)})`;
+  }
+  return `type=${Array.isArray(content) ? "array" : typeof content}`;
+}
+
+function summarizeCaptureDecision(text: string): string {
+  const trimmed = text.trim();
+  const preview = sanitizeForContext(trimmed).slice(0, 120);
+  return `len=${trimmed.length}, trigger=${shouldCapture(trimmed) ? "Y" : "N"}, noise=${isNoise(trimmed) ? "Y" : "N"}, preview=${JSON.stringify(preview)}`;
+}
+
 // ============================================================================
 // Session Path Helpers
 // ============================================================================
@@ -1075,7 +1462,7 @@ async function findPreviousSessionFile(
       );
       if (nonReset.length > 0) return join(sessionsDir, nonReset[0]);
     }
-  } catch {}
+  } catch { }
 }
 
 // ============================================================================
@@ -1165,6 +1552,36 @@ function createMdMirrorWriter(
 }
 
 // ============================================================================
+// Admission Control Audit Writer
+// ============================================================================
+
+function createAdmissionRejectionAuditWriter(
+  config: PluginConfig,
+  resolvedDbPath: string,
+  api: OpenClawPluginApi,
+): ((entry: AdmissionRejectionAuditEntry) => Promise<void>) | null {
+  if (
+    config.admissionControl?.enabled !== true ||
+    config.admissionControl.persistRejectedAudits !== true
+  ) {
+    return null;
+  }
+
+  const filePath = api.resolvePath(
+    resolveRejectedAuditFilePath(resolvedDbPath, config.admissionControl),
+  );
+
+  return async (entry: AdmissionRejectionAuditEntry) => {
+    try {
+      await mkdir(dirname(filePath), { recursive: true });
+      await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
+    } catch (err) {
+      api.logger.warn(`memory-lancedb-pro: admission rejection audit write failed: ${String(err)}`);
+    }
+  };
+}
+
+// ============================================================================
 // Version
 // ============================================================================
 
@@ -1206,7 +1623,7 @@ const memoryLanceDBProPlugin = {
     } catch (err) {
       api.logger.warn(
         `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-          `  The plugin will still attempt to start, but writes may fail.`,
+        `  The plugin will still attempt to start, but writes may fail.`,
       );
     }
 
@@ -1223,26 +1640,224 @@ const memoryLanceDBProPlugin = {
       model: config.embedding.model || "text-embedding-3-small",
       baseURL: config.embedding.baseURL,
       dimensions: config.embedding.dimensions,
+      omitDimensions: config.embedding.omitDimensions,
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
+      chunking: config.embedding.chunking,
     });
-    const retriever = createRetriever(store, embedder, {
-      ...DEFAULT_RETRIEVAL_CONFIG,
-      ...config.retrieval,
+    // Initialize decay engine
+    const decayEngine = createDecayEngine({
+      ...DEFAULT_DECAY_CONFIG,
+      ...(config.decay || {}),
     });
-
-    // Access reinforcement tracker (debounced write-back)
-    const accessTracker = new AccessTracker({
+    const tierManager = createTierManager({
+      ...DEFAULT_TIER_CONFIG,
+      ...(config.tier || {}),
+    });
+    const retriever = createRetriever(
       store,
-      logger: api.logger,
-      debounceMs: 5000,
-    });
-    retriever.setAccessTracker(accessTracker);
-
+      embedder,
+      {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config.retrieval,
+      },
+      { decayEngine },
+    );
     const scopeManager = createScopeManager(config.scopes);
+
+    // ClawTeam integration: extend accessible scopes via env var
+    const clawteamScopes = parseClawteamScopes(process.env.CLAWTEAM_MEMORY_SCOPE);
+    if (clawteamScopes.length > 0) {
+      applyClawteamScopes(scopeManager, clawteamScopes);
+      api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${clawteamScopes.join(", ")}`);
+    }
+
     const migrator = createMigrator(store);
 
+    // Initialize smart extraction
+    let smartExtractor: SmartExtractor | null = null;
+    if (config.smartExtraction !== false) {
+      try {
+        const llmAuth = config.llm?.auth || "api-key";
+        const llmApiKey = llmAuth === "oauth"
+          ? undefined
+          : config.llm?.apiKey
+            ? resolveEnvVars(config.llm.apiKey)
+            : resolveFirstApiKey(config.embedding.apiKey);
+        const llmBaseURL = llmAuth === "oauth"
+          ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+          : config.llm?.baseURL
+            ? resolveEnvVars(config.llm.baseURL)
+            : config.embedding.baseURL;
+        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+        const llmOauthPath = llmAuth === "oauth"
+          ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+          : undefined;
+        const llmOauthProvider = llmAuth === "oauth"
+          ? config.llm?.oauthProvider
+          : undefined;
+        const llmTimeoutMs = resolveLlmTimeoutMs(config);
+
+        const llmClient = createLlmClient({
+          auth: llmAuth,
+          apiKey: llmApiKey,
+          model: llmModel,
+          baseURL: llmBaseURL,
+          oauthProvider: llmOauthProvider,
+          oauthPath: llmOauthPath,
+          timeoutMs: llmTimeoutMs,
+          log: (msg: string) => api.logger.debug(msg),
+        });
+
+        // Initialize embedding-based noise prototype bank (async, non-blocking)
+        const noiseBank = new NoisePrototypeBank(
+          (msg: string) => api.logger.debug(msg),
+        );
+        noiseBank.init(embedder).catch((err) =>
+          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+        );
+
+        const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(
+          config,
+          resolvedDbPath,
+          api,
+        );
+
+        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+          user: "User",
+          extractMinMessages: config.extractMinMessages ?? 4,
+          extractMaxChars: config.extractMaxChars ?? 8000,
+          defaultScope: config.scopes?.default ?? "global",
+          workspaceBoundary: config.workspaceBoundary,
+          admissionControl: config.admissionControl,
+          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+          log: (msg: string) => api.logger.info(msg),
+          debugLog: (msg: string) => api.logger.debug(msg),
+          noiseBank,
+        });
+
+        api.logger.info(
+          "memory-lancedb-pro: smart extraction enabled (LLM model: "
+          + llmModel
+          + ", timeoutMs: "
+          + llmTimeoutMs
+          + ", noise bank: ON)",
+        );
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      }
+    }
+
+    // Extraction rate limiter (Feature 7: Adaptive Extraction Throttling)
+    // NOTE: This rate limiter is global — shared across all agents in multi-agent setups.
+    const extractionRateLimiter = createExtractionRateLimiter({
+      maxExtractionsPerHour: config.extractionThrottle?.maxExtractionsPerHour,
+    });
+
+    async function sleep(ms: number): Promise<void> {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function retrieveWithRetry(params: {
+      query: string;
+      limit: number;
+      scopeFilter?: string[];
+      category?: string;
+    }) {
+      let results = await retriever.retrieve(params);
+      if (results.length === 0) {
+        await sleep(75);
+        results = await retriever.retrieve(params);
+      }
+      return results;
+    }
+
+    async function runRecallLifecycle(
+      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
+      scopeFilter?: string[],
+    ): Promise<Map<string, string>> {
+      const now = Date.now();
+      type LifecycleEntry = {
+        id: string;
+        text: string;
+        category: "preference" | "fact" | "decision" | "entity" | "other";
+        scope: string;
+        importance: number;
+        timestamp: number;
+        metadata?: string;
+      };
+      const lifecycleEntries = new Map<string, LifecycleEntry>();
+      const tierOverrides = new Map<string, string>();
+
+      await Promise.allSettled(
+        results.map(async (result) => {
+          const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+          const updated = await store.patchMetadata(
+            result.entry.id,
+            {
+              access_count: metadata.access_count + 1,
+              last_accessed_at: now,
+            },
+            scopeFilter,
+          );
+          lifecycleEntries.set(result.entry.id, updated ?? result.entry);
+        }),
+      );
+
+      try {
+        if (scopeFilter !== undefined) {
+          const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
+          for (const entry of recentEntries) {
+            if (!lifecycleEntries.has(entry.id)) {
+              lifecycleEntries.set(entry.id, entry);
+            }
+          }
+        } else {
+          api.logger.debug(`memory-lancedb-pro: skipping tier maintenance preload for bypass scope filter`);
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
+      }
+
+      const candidates = Array.from(lifecycleEntries.values())
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
+
+      if (candidates.length === 0) {
+        return tierOverrides;
+      }
+
+      try {
+        const memories = candidates.map((entry) => toLifecycleMemory(entry.id, entry));
+        const decayScores = decayEngine.scoreAll(memories, now);
+        const transitions = tierManager.evaluateAll(memories, decayScores, now);
+
+        await Promise.allSettled(
+          transitions.map(async (transition) => {
+            await store.patchMetadata(
+              transition.memoryId,
+              {
+                tier: transition.toTier,
+                tier_updated_at: now,
+              },
+              scopeFilter,
+            );
+            tierOverrides.set(transition.memoryId, transition.toTier);
+          }),
+        );
+
+        if (transitions.length > 0) {
+          api.logger.info(
+            `memory-lancedb-pro: tier maintenance applied ${transitions.length} transition(s)`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance failed: ${String(err)}`);
+      }
+
+      return tierOverrides;
+    }
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
     const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
@@ -1313,198 +1928,40 @@ const memoryLanceDBProPlugin = {
       return clipped;
     };
 
-    const parseSectionBullets = (markdown: string, heading: string): string[] => {
-      const lines = markdown.split(/\r?\n/);
-      const headingNeedle = `## ${heading}`.toLowerCase();
-      let inSection = false;
-      const collected: string[] = [];
-      for (const raw of lines) {
-        const line = raw.trim();
-        const lower = line.toLowerCase();
-        if (lower.startsWith("## ")) {
-          inSection = lower === headingNeedle;
-          continue;
-        }
-        if (!inSection) continue;
-        if (line.startsWith("- ") || line.startsWith("* ")) {
-          const normalized = line.slice(2).trim();
-          if (normalized) collected.push(normalized);
-        }
-      }
-      return collected;
-    };
-
-    const extractReflectionSlices = (reflectionText: string): { invariants: string[]; derived: string[] } => {
-      const isPlaceholderSlice = (line: string): boolean => {
-        const normalized = line.replace(/\*\*/g, "").trim();
-        if (!normalized) return true;
-        if (/^\(none( captured)?\)$/i.test(normalized)) return true;
-        if (/^(invariants?|reflections?|derived)[:：]$/i.test(normalized)) return true;
-        if (/apply this session'?s deltas next run/i.test(normalized)) return true;
-        if (/apply this session'?s distilled changes next run/i.test(normalized)) return true;
-        if (/investigate why embedded reflection generation failed/i.test(normalized)) return true;
-        return false;
-      };
-      const normalizeSliceLine = (line: string): string =>
-        line
-          .replace(/\*\*/g, "")
-          .replace(/^(invariants?|reflections?|derived)[:：]\s*/i, "")
-          .trim();
-      const cleanSliceLines = (lines: string[]): string[] =>
-        lines
-          .map(normalizeSliceLine)
-          .filter((line) => !isPlaceholderSlice(line));
-      const isInvariantRuleLike = (line: string): boolean =>
-        /^(always|never|when\b|if\b|before\b|after\b|prefer\b|avoid\b|require\b|only\b|do not\b|must\b|should\b)/i.test(line) ||
-        /\b(must|should|never|always|prefer|avoid|required?)\b/i.test(line);
-      const isDerivedDeltaLike = (line: string): boolean =>
-        /^(this run|next run|going forward|follow-up|re-check|retest|verify|confirm|avoid repeating|adjust|change|update|retry|keep|watch)\b/i.test(line) ||
-        /\b(this run|next run|delta|change|adjust|retry|re-check|retest|verify|confirm|avoid repeating|follow-up)\b/i.test(line);
-      const isOpenLoopAction = (line: string): boolean =>
-        /^(investigate|verify|confirm|re-check|retest|update|add|remove|fix|avoid|keep|watch|document)\b/i.test(line);
-
-      const invariantSection = parseSectionBullets(reflectionText, "Invariants");
-      const derivedSection = parseSectionBullets(reflectionText, "Derived");
-      const mergedSection = parseSectionBullets(reflectionText, "Invariants & Reflections");
-
-      const invariantsPrimary = cleanSliceLines(invariantSection).filter(isInvariantRuleLike);
-      const derivedPrimary = cleanSliceLines(derivedSection).filter(isDerivedDeltaLike);
-
-      const invariantLinesLegacy = cleanSliceLines(
-        mergedSection.filter((line) => /invariant|stable|policy|rule/i.test(line))
-      ).filter(isInvariantRuleLike);
-      const reflectionLinesLegacy = cleanSliceLines(
-        mergedSection.filter((line) => /reflect|inherit|derive|change|apply/i.test(line))
-      ).filter(isDerivedDeltaLike);
-      const openLoopLines = cleanSliceLines(parseSectionBullets(reflectionText, "Open loops / next actions"))
-        .filter(isOpenLoopAction)
-        .filter(isDerivedDeltaLike);
-      const durableDecisionLines = cleanSliceLines(parseSectionBullets(reflectionText, "Decisions (durable)"))
-        .filter(isInvariantRuleLike);
-
-      const invariants = invariantsPrimary.length > 0
-        ? invariantsPrimary
-        : (invariantLinesLegacy.length > 0 ? invariantLinesLegacy : durableDecisionLines);
-      const derived = derivedPrimary.length > 0
-        ? derivedPrimary
-        : [...reflectionLinesLegacy, ...openLoopLines];
-      return {
-        invariants: invariants.slice(0, 8),
-        derived: derived.slice(0, 10),
-      };
-    };
-
-    const parseMemoryMetadata = (metadataRaw: string | undefined): Record<string, unknown> => {
-      if (!metadataRaw) return {};
-      try {
-        const parsed = JSON.parse(metadataRaw);
-        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
-      } catch {
-        return {};
-      }
-    };
-
-    const storeReflectionToLanceDB = async (params: {
-      reflectionText: string;
-      sessionKey: string;
-      sessionId: string;
-      agentId: string;
-      command: string;
-      scope: string;
-      toolErrorSignals: ReflectionErrorSignal[];
-      runAt: number;
-      usedFallback: boolean;
-    }) => {
-      const slices = extractReflectionSlices(params.reflectionText);
-      const dateYmd = new Date(params.runAt).toISOString().split("T")[0];
-      const payload = [
-        `reflection:${params.scope} · ${dateYmd}`,
-        `Session Reflection (${new Date(params.runAt).toISOString()})`,
-        `Session Key: ${params.sessionKey}`,
-        `Session ID: ${params.sessionId}`,
-        "",
-        "Invariants:",
-        ...(slices.invariants.length > 0 ? slices.invariants.map((x) => `- ${x}`) : ["- (none)"]),
-        "",
-        "Derived:",
-        ...(slices.derived.length > 0 ? slices.derived.map((x) => `- ${x}`) : ["- (none)"]),
-        "",
-        "Reflection:",
-        params.reflectionText.trim(),
-      ].join("\n");
-
-      const vector = await embedder.embedPassage(payload);
-      const existing = await store.vectorSearch(vector, 1, 0.1, [params.scope]);
-      if (existing.length > 0 && existing[0].score > 0.97) {
-        return { stored: false, slices };
-      }
-
-      await store.store({
-        text: payload,
-        vector,
-        category: "reflection",
-        scope: params.scope,
-        importance: 0.75,
-        metadata: JSON.stringify({
-          type: "memory-reflection",
-          stage: "reflect-store",
-          sessionKey: params.sessionKey,
-          sessionId: params.sessionId,
-          agentId: params.agentId,
-          command: params.command,
-          storedAt: params.runAt,
-          invariants: slices.invariants,
-          derived: slices.derived,
-          usedFallback: params.usedFallback,
-          errorSignals: params.toolErrorSignals.map((s) => s.signatureHash),
-        }),
-      });
-      return { stored: true, slices };
-    };
-
-    const loadAgentReflectionSlices = async (agentId: string, scopeFilter: string[]) => {
-      const cacheKey = `${agentId}::${[...scopeFilter].sort().join(",")}`;
+    const loadAgentReflectionSlices = async (agentId: string, scopeFilter?: string[]) => {
+      const scopeKey = Array.isArray(scopeFilter)
+        ? `scopes:${[...scopeFilter].sort().join(",")}`
+        : "<NO_SCOPE_FILTER>";
+      const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
 
-      const now = Date.now();
-      const entries = await store.list(scopeFilter, undefined, 120, 0);
-      const reflections = entries
-        .map((entry) => ({ entry, metadata: parseMemoryMetadata(entry.metadata) }))
-        .filter(({ metadata }) =>
-          metadata.type === "memory-reflection" && (metadata.agentId === agentId || metadata.agentId === "main")
-        )
-        .sort((a, b) => b.entry.timestamp - a.entry.timestamp)
-        .slice(0, 6);
-      const recentReflections = reflections.filter(
-        ({ entry }) => now - entry.timestamp <= DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
-      );
-
-      const invariants: string[] = [];
-      const derived: string[] = [];
-      for (const { metadata } of recentReflections) {
-        const inv = Array.isArray(metadata.invariants) ? metadata.invariants.map((x) => String(x)) : [];
-        for (const item of inv) {
-          if (item && !invariants.includes(item)) invariants.push(item);
-          if (invariants.length >= 8) break;
-        }
+      // Prefer reflection-category rows to avoid full-table reads on bypass callers.
+      // Fall back to an uncategorized scan only when the category query produced no
+      // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
+      let entries = await store.list(scopeFilter, "reflection", 240, 0);
+      let slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId,
+        deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+      });
+      if (slices.invariants.length === 0 && slices.derived.length === 0) {
+        const legacyEntries = await store.list(scopeFilter, undefined, 240, 0);
+        entries = legacyEntries.filter((entry) => {
+          try {
+            const metadata = parseReflectionMetadata(entry.metadata);
+            return isReflectionMetadataType(metadata.type) && isOwnedByAgent(metadata, agentId);
+          } catch {
+            return false;
+          }
+        });
+        slices = loadAgentReflectionSlicesFromEntries({
+          entries,
+          agentId,
+          deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+        });
       }
-
-      // Derived focus should come from the latest recent non-fallback reflection with actual delta lines.
-      const latestForDerived = recentReflections.find(({ metadata }) =>
-        metadata.usedFallback !== true &&
-        Array.isArray(metadata.derived) &&
-        metadata.derived.some((x: unknown) => typeof x === "string" && x.trim().length > 0 && !/^\(none/i.test(x.trim()))
-      );
-      if (latestForDerived) {
-        const der = Array.isArray(latestForDerived.metadata.derived)
-          ? latestForDerived.metadata.derived.map((x) => String(x))
-          : [];
-        for (const item of der) {
-          if (item && !derived.includes(item)) derived.push(item);
-          if (derived.length >= 10) break;
-        }
-      }
+      const { invariants, derived } = slices;
       const next = { updatedAt: Date.now(), invariants, derived };
       reflectionByAgentCache.set(cacheKey, next);
       return next;
@@ -1517,9 +1974,48 @@ const memoryLanceDBProPlugin = {
     // Map<sessionId, turnCounter> - manual turn tracking per session
     const turnCounter = new Map<string, number>();
 
+    // Track how many normalized user texts have already been seen per session snapshot.
+    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
+    // growth in long-running processes with many distinct sessions.
+    const autoCaptureSeenTextCount = new Map<string, number>();
+    const autoCapturePendingIngressTexts = new Map<string, string[]>();
+    const autoCaptureRecentTexts = new Map<string, string[]>();
+
     api.logger.info(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
+      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
+    api.logger.info(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+
+    api.on("message_received", (event: any, ctx: any) => {
+      const conversationKey = buildAutoCaptureConversationKeyFromIngress(
+        ctx.channelId,
+        ctx.conversationId,
+      );
+      const normalized = normalizeAutoCaptureText("user", event.content, shouldSkipReflectionMessage);
+      if (conversationKey && normalized) {
+        const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
+        queue.push(normalized);
+        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+        pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress message_received channel=${ctx.channelId} account=${ctx.accountId || "unknown"} conversation=${ctx.conversationId || "unknown"} from=${event.from} len=${event.content.trim().length} preview=${summarizeTextPreview(event.content)}`,
+      );
+    });
+
+    api.on("before_message_write", (event: any, ctx: any) => {
+      const message = event.message as Record<string, unknown> | undefined;
+      const role =
+        message && typeof message.role === "string" && message.role.trim().length > 0
+          ? message.role
+          : "unknown";
+      if (role !== "user") {
+        return;
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress before_message_write agent=${ctx.agentId || event.agentId || "unknown"} sessionKey=${ctx.sessionKey || event.sessionKey || "unknown"} role=${role} ${summarizeMessageContent(message?.content)}`,
+      );
+    });
 
     // ========================================================================
     // Markdown Mirror
@@ -1541,12 +2037,135 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        workspaceBoundary: config.workspaceBoundary,
       },
       {
         enableManagementTools: config.enableManagementTools,
         enableSelfImprovementTools: config.selfImprovement?.enabled !== false,
       }
     );
+
+    // ========================================================================
+    // Memory Compaction (Progressive Summarization)
+    // ========================================================================
+
+    if (config.enableManagementTools) {
+      api.registerTool({
+        name: "memory_compact",
+        description:
+          "Consolidate semantically similar old memories into refined single entries " +
+          "(progressive summarization). Reduces noise and improves retrieval quality over time. " +
+          "Use dry_run:true first to preview the compaction plan without making changes.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            dry_run: {
+              type: "boolean",
+              description: "Preview clusters without writing changes. Default: false.",
+            },
+            min_age_days: {
+              type: "number",
+              description: "Only compact memories at least this many days old. Default: 7.",
+            },
+            similarity_threshold: {
+              type: "number",
+              description: "Cosine similarity threshold for clustering [0-1]. Default: 0.88.",
+            },
+            scopes: {
+              type: "array",
+              items: { type: "string" },
+              description: "Scope filter. Omit to compact all scopes.",
+            },
+          },
+          required: [],
+        },
+        execute: async (args: Record<string, unknown>) => {
+          const compactionCfg: CompactionConfig = {
+            enabled: true,
+            minAgeDays:
+              typeof args.min_age_days === "number"
+                ? args.min_age_days
+                : (config.memoryCompaction?.minAgeDays ?? 7),
+            similarityThreshold:
+              typeof args.similarity_threshold === "number"
+                ? Math.max(0, Math.min(1, args.similarity_threshold))
+                : (config.memoryCompaction?.similarityThreshold ?? 0.88),
+            minClusterSize: config.memoryCompaction?.minClusterSize ?? 2,
+            maxMemoriesToScan: config.memoryCompaction?.maxMemoriesToScan ?? 200,
+            dryRun: args.dry_run === true,
+            cooldownHours: config.memoryCompaction?.cooldownHours ?? 24,
+          };
+          const scopes =
+            Array.isArray(args.scopes) && args.scopes.length > 0
+              ? (args.scopes as string[])
+              : undefined;
+
+          const result = await runCompaction(
+            store,
+            embedder,
+            compactionCfg,
+            scopes,
+            api.logger,
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    scanned: result.scanned,
+                    clustersFound: result.clustersFound,
+                    memoriesDeleted: result.memoriesDeleted,
+                    memoriesCreated: result.memoriesCreated,
+                    dryRun: result.dryRun,
+                    summary: result.dryRun
+                      ? `Dry run: found ${result.clustersFound} cluster(s) in ${result.scanned} memories — no changes made.`
+                      : `Compacted ${result.memoriesDeleted} memories into ${result.memoriesCreated} consolidated entries.`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        },
+      });
+    }
+
+    // Auto-compaction at gateway_start (if enabled, respects cooldown)
+    if (config.memoryCompaction?.enabled) {
+      api.on("gateway_start", () => {
+        const compactionStateFile = join(
+          dirname(resolvedDbPath),
+          ".compaction-state.json",
+        );
+        const compactionCfg: CompactionConfig = {
+          enabled: true,
+          minAgeDays: config.memoryCompaction!.minAgeDays ?? 7,
+          similarityThreshold: config.memoryCompaction!.similarityThreshold ?? 0.88,
+          minClusterSize: config.memoryCompaction!.minClusterSize ?? 2,
+          maxMemoriesToScan: config.memoryCompaction!.maxMemoriesToScan ?? 200,
+          dryRun: false,
+          cooldownHours: config.memoryCompaction!.cooldownHours ?? 24,
+        };
+
+        shouldRunCompaction(compactionStateFile, compactionCfg.cooldownHours)
+          .then(async (should) => {
+            if (!should) return;
+            await recordCompactionRun(compactionStateFile);
+            const result = await runCompaction(store, embedder, compactionCfg, undefined, api.logger);
+            if (result.clustersFound > 0) {
+              api.logger.info(
+                `memory-compactor [auto]: compacted ${result.memoriesDeleted} → ${result.memoriesCreated} entries`,
+              );
+            }
+          })
+          .catch((err) => {
+            api.logger.warn(`memory-compactor [auto]: failed: ${String(err)}`);
+          });
+      });
+    }
 
     // ========================================================================
     // Register CLI Commands
@@ -1559,6 +2178,38 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
+        llmClient: smartExtractor ? (() => {
+          try {
+            const llmAuth = config.llm?.auth || "api-key";
+            const llmApiKey = llmAuth === "oauth"
+              ? undefined
+              : config.llm?.apiKey
+                ? resolveEnvVars(config.llm.apiKey)
+                : resolveFirstApiKey(config.embedding.apiKey);
+            const llmBaseURL = llmAuth === "oauth"
+              ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
+              : config.llm?.baseURL
+                ? resolveEnvVars(config.llm.baseURL)
+                : config.embedding.baseURL;
+            const llmOauthPath = llmAuth === "oauth"
+              ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
+              : undefined;
+            const llmOauthProvider = llmAuth === "oauth"
+              ? config.llm?.oauthProvider
+              : undefined;
+            const llmTimeoutMs = resolveLlmTimeoutMs(config);
+            return createLlmClient({
+              auth: llmAuth,
+              apiKey: llmApiKey,
+              model: config.llm?.model || "openai/gpt-oss-120b",
+              baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
+            });
+          } catch { return undefined; }
+        })() : undefined,
       }),
       { commands: ["memory-pro"] },
     );
@@ -1569,45 +2220,107 @@ const memoryLanceDBProPlugin = {
 
     // Auto-recall: inject relevant memories before agent starts
     // Default is OFF to prevent the model from accidentally echoing injected context.
-    if (config.autoRecall === true) {
-      api.on("before_agent_start", async (event, ctx) => {
+    // recallMode: "full" (default when autoRecall=true) | "summary" (L0 only) | "adaptive" (intent-based) | "off"
+    const recallMode = config.recallMode || "full";
+    if (config.autoRecall === true && recallMode !== "off") {
+      // Cache the most recent raw user message per session so the
+      // before_prompt_build gating can check the *user* text, not the full
+      // assembled prompt (which includes system instructions and is too long
+      // for the short-message skip heuristic in shouldSkipRetrieval).
+      const lastRawUserMessage = new Map<string, string>();
+      api.on("message_received", (event: any, ctx: any) => {
+        // Both message_received and before_prompt_build have channelId in ctx,
+        // so use it as the shared cache key for raw user message gating.
+        const cacheKey = ctx?.channelId || ctx?.conversationId || "default";
+        const raw = typeof event.content === "string" ? event.content.trim() : "";
+        // Strip leading bot mentions (@BotName or <@id>) so gating sees the
+        // actual user intent, not the mention prefix.
+        const text = raw.replace(/^(?:@\S+\s*|<@!?\d+>\s*)+/, "").trim();
+        if (text) lastRawUserMessage.set(cacheKey, text);
+      });
+
+      const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
+      api.on("before_prompt_build", async (event: any, ctx: any) => {
+        // Manually increment turn counter for this session
+        const sessionId = ctx?.sessionId || "default";
+
+        // Use cached raw user message for gating (short-message skip, greeting
+        // detection, etc.).  Fall back to event.prompt if no cached message is
+        // available (e.g. first message or non-channel triggers).
+        const cacheKey = ctx?.channelId || sessionId;
+        const gatingText = lastRawUserMessage.get(cacheKey) || event.prompt || "";
         if (
           !event.prompt ||
-          shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)
+          shouldSkipRetrieval(gatingText, config.autoRecallMinLength)
         ) {
           return;
         }
-
-        // Manually increment turn counter for this session
-        const sessionId = ctx?.sessionId || "default";
         const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
         turnCounter.set(sessionId, currentTurn);
 
-        try {
+        // Wrap the entire recall pipeline in a timeout so slow embedding/rerank
+        // API calls cannot stall agent startup indefinitely.  Without this guard
+        // the session lock is held for the full duration of the retrieval chain
+        // (embedding → rerank → lifecycle), which can silently drop messages on
+        // channels like Telegram when subsequent requests hit lock timeouts.
+        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
-          const agentId = ctx?.agentId || "main";
-          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
-          const results = await retriever.retrieve({
-            query: event.prompt,
-            limit: 3,
+          // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
+          // Auto-recall only needs the user's intent, not full attachment text.
+          const MAX_RECALL_QUERY_LENGTH = 1_000;
+          let recallQuery = event.prompt;
+          if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
+            const originalLength = recallQuery.length;
+            recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
+            api.logger.info(
+              `memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${MAX_RECALL_QUERY_LENGTH} chars`
+            );
+          }
+
+          const configMaxItems = clampInt(config.autoRecallMaxItems ?? 3, 1, 20);
+          const maxPerTurn = clampInt(config.maxRecallPerTurn ?? 10, 1, 50);
+          // maxRecallPerTurn acts as a hard ceiling on top of autoRecallMaxItems (#345)
+          const autoRecallMaxItems = Math.min(configMaxItems, maxPerTurn);
+          const autoRecallMaxChars = clampInt(config.autoRecallMaxChars ?? 600, 64, 8000);
+          const autoRecallPerItemMaxChars = clampInt(config.autoRecallPerItemMaxChars ?? 180, 32, 1000);
+          const retrieveLimit = clampInt(Math.max(autoRecallMaxItems * 2, autoRecallMaxItems), 1, 20);
+
+          // Adaptive intent analysis (zero-LLM-cost pattern matching)
+          const intent = recallMode === "adaptive" ? analyzeIntent(recallQuery) : undefined;
+          if (intent) {
+            api.logger.debug?.(
+              `memory-lancedb-pro: adaptive recall intent=${intent.label} depth=${intent.depth} confidence=${intent.confidence} categories=[${intent.categories.join(",")}]`,
+            );
+          }
+
+          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
+            query: recallQuery,
+            limit: retrieveLimit,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
-          });
+          }), config.workspaceBoundary);
 
           if (results.length === 0) {
             return;
           }
 
+          // Apply intent-based category boost for adaptive mode
+          const rankedResults = intent ? applyCategoryBoost(results, intent) : results;
+
           // Filter out redundant memories based on session history
-          const minRepeated = config.autoRecallMinRepeated ?? 0;
+          const minRepeated = config.autoRecallMinRepeated ?? 8;
+          let dedupFilteredCount = 0;
 
           // Only enable dedup logic when minRepeated > 0
-          let finalResults = results;
+          let finalResults = rankedResults;
 
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
-            const filteredResults = results.filter((r) => {
+            const filteredResults = rankedResults.filter((r) => {
               const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
               const diff = currentTurn - lastTurn;
               const isRedundant = diff < minRepeated;
@@ -1617,6 +2330,7 @@ const memoryLanceDBProPlugin = {
                   `memory-lancedb-pro: skipping redundant memory ${r.entry.id.slice(0, 8)} (last seen at turn ${lastTurn}, current turn ${currentTurn}, min ${minRepeated})`,
                 );
               }
+              if (isRedundant) dedupFilteredCount++;
               return !isRedundant;
             });
 
@@ -1629,24 +2343,156 @@ const memoryLanceDBProPlugin = {
               return;
             }
 
-            // Update history with successfully injected memories
-            for (const r of filteredResults) {
-              sessionHistory.set(r.entry.id, currentTurn);
-            }
-            recallHistory.set(sessionId, sessionHistory);
-
             finalResults = filteredResults;
           }
 
-          const memoryContext = finalResults
-            .map(
-              (r) =>
-                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
-            )
-            .join("\n");
+          let stateFilteredCount = 0;
+          let suppressedFilteredCount = 0;
+          const governanceEligible = finalResults.filter((r) => {
+            const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+            if (meta.state !== "confirmed") {
+              stateFilteredCount++;
+              return false;
+            }
+            if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") {
+              stateFilteredCount++;
+              return false;
+            }
+            if (meta.suppressed_until_turn > 0 && currentTurn <= meta.suppressed_until_turn) {
+              suppressedFilteredCount++;
+              return false;
+            }
+            return true;
+          });
+
+          if (governanceEligible.length === 0) {
+            api.logger.info?.(
+              `memory-lancedb-pro: auto-recall skipped after governance filters (hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount})`,
+            );
+            return;
+          }
+
+          // Determine effective per-item char limit based on recall mode and intent depth
+          const effectivePerItemMaxChars = (() => {
+            if (recallMode === "summary") return Math.min(autoRecallPerItemMaxChars, 80); // L0 only
+            if (!intent) return autoRecallPerItemMaxChars; // "full" mode
+            // Adaptive mode: depth determines char budget
+            switch (intent.depth) {
+              case "l0": return Math.min(autoRecallPerItemMaxChars, 80);
+              case "l1": return autoRecallPerItemMaxChars; // default budget
+              case "full": return Math.min(autoRecallPerItemMaxChars * 3, 1000);
+            }
+          })();
+
+          const preBudgetCandidates = governanceEligible.map((r) => {
+            const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
+            const displayCategory = metaObj.memory_category || r.entry.category;
+            const displayTier = metaObj.tier || "";
+            const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
+            // Select content tier based on recallMode/intent depth
+            const contentText = recallMode === "summary"
+              ? (metaObj.l0_abstract || r.entry.text)
+              : intent?.depth === "full"
+                ? (r.entry.text) // full text for deep queries
+                : (metaObj.l0_abstract || r.entry.text); // L0/L1 default
+            const summary = sanitizeForContext(contentText).slice(0, effectivePerItemMaxChars);
+            return {
+              id: r.entry.id,
+              prefix: `${tierPrefix}[${displayCategory}:${r.entry.scope}]`,
+              summary,
+              chars: summary.length,
+              meta: metaObj,
+            };
+          });
+
+          const preBudgetItems = preBudgetCandidates.length;
+          const preBudgetChars = preBudgetCandidates.reduce((sum, item) => sum + item.chars, 0);
+          const selected = [];
+          let usedChars = 0;
+
+          for (const candidate of preBudgetCandidates) {
+            if (selected.length >= autoRecallMaxItems) break;
+            const remaining = autoRecallMaxChars - usedChars;
+            if (remaining <= 0) break;
+
+            if (candidate.chars <= remaining) {
+              selected.push({
+                id: candidate.id,
+                line: `- ${candidate.prefix} ${candidate.summary}`,
+                chars: candidate.chars,
+                meta: candidate.meta,
+              });
+              usedChars += candidate.chars;
+              continue;
+            }
+
+            const shortened = candidate.summary.slice(0, remaining).trim();
+            if (!shortened) continue;
+            const line = `- ${candidate.prefix} ${shortened}`;
+            selected.push({
+              id: candidate.id,
+              line,
+              chars: shortened.length,
+              meta: candidate.meta,
+            });
+            usedChars += shortened.length;
+            break;
+          }
+
+          if (selected.length === 0) {
+            api.logger.info?.(
+              `memory-lancedb-pro: auto-recall skipped injection after budgeting (hits=${results.length}, dedupFiltered=${dedupFilteredCount}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars})`,
+            );
+            return;
+          }
+
+          if (minRepeated > 0) {
+            const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
+            for (const item of selected) {
+              sessionHistory.set(item.id, currentTurn);
+            }
+            recallHistory.set(sessionId, sessionHistory);
+          }
+
+          const injectedAt = Date.now();
+          await Promise.allSettled(
+            selected.map(async (item) => {
+              const meta = item.meta;
+              const staleInjected =
+                typeof meta.last_injected_at === "number" &&
+                meta.last_injected_at > 0 &&
+                (
+                  typeof meta.last_confirmed_use_at !== "number" ||
+                  meta.last_confirmed_use_at < meta.last_injected_at
+                );
+              const nextBadRecallCount = staleInjected
+                ? meta.bad_recall_count + 1
+                : meta.bad_recall_count;
+              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
+              await store.patchMetadata(
+                item.id,
+                {
+                  injected_count: meta.injected_count + 1,
+                  last_injected_at: injectedAt,
+                  bad_recall_count: nextBadRecallCount,
+                  suppressed_until_turn: shouldSuppress
+                    ? Math.max(meta.suppressed_until_turn, currentTurn + minRepeated)
+                    : meta.suppressed_until_turn,
+                },
+                accessibleScopes,
+              );
+            }),
+          );
+
+          const memoryContext = selected.map((item) => item.line).join("\n");
+
+          const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, injectedIds=${injectedIds}`,
+          );
 
           api.logger.info?.(
-            `memory-lancedb-pro: injecting ${finalResults.length} memories into context for agent ${agentId}`,
+            `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
           return {
@@ -1656,27 +2502,92 @@ const memoryLanceDBProPlugin = {
               `${memoryContext}\n` +
               `[END UNTRUSTED DATA]\n` +
               `</relevant-memories>`,
+            // Mark as ephemeral so the host framework's compaction logic can
+            // safely discard injected memory blocks instead of persisting them
+            // into the session transcript (#345).
+            ephemeral: true,
           };
+        };
+
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const result = await Promise.race([
+            recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
+            new Promise<undefined>((resolve) => {
+              timeoutId = setTimeout(() => {
+                api.logger.warn(
+                  `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
+                );
+                resolve(undefined);
+              }, AUTO_RECALL_TIMEOUT_MS);
+            }),
+          ]);
+          return result;
         } catch (err) {
+          clearTimeout(timeoutId);
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
-      });
+      }, { priority: 10 });
+
+      // Clean up auto-recall session state on session end to prevent unbounded
+      // growth of recallHistory and turnCounter Maps (#345).
+      api.on("session_end", (_event: any, ctx: any) => {
+        const sessionId = ctx?.sessionId || "";
+        if (sessionId) {
+          recallHistory.delete(sessionId);
+          turnCounter.delete(sessionId);
+          lastRawUserMessage.delete(sessionId);
+        }
+        // Also clean by channelId/conversationId if present (shared cache key)
+        const cacheKey = ctx?.channelId || ctx?.conversationId || "";
+        if (cacheKey && cacheKey !== sessionId) {
+          lastRawUserMessage.delete(cacheKey);
+        }
+      }, { priority: 10 });
     }
 
     // Auto-capture: analyze and store important information after agent ends
     if (config.autoCapture !== false) {
-      api.on("agent_end", async (event, ctx) => {
+      type AgentEndAutoCaptureHook = {
+        (event: any, ctx: any): void;
+        __lastRun?: Promise<void>;
+      };
+
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
 
+        // Fire-and-forget: run capture work in the background so the hook
+        // returns immediately and does not hold the session lock.  Blocking
+        // here causes downstream channel deliveries (e.g. Telegram) to be
+        // silently dropped when the session store lock times out.
+        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/260
+        const backgroundRun = (async () => {
         try {
+          // Feature 7: Check extraction rate limit before any work
+          if (extractionRateLimiter.isRateLimited()) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped (rate limited: ${extractionRateLimiter.getRecentCount()} extractions in last hour)`,
+            );
+            return;
+          }
+
           // Determine agent ID and default scope
-          const agentId = ctx?.agentId || "main";
-          const defaultScope = scopeManager.getDefaultScope(agentId);
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
+          const defaultScope = isSystemBypassId(agentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(agentId);
+          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
+
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
+          );
 
           // Extract text content from messages
-          const texts: string[] = [];
+          const eligibleTexts: string[] = [];
+          let skippedAutoCaptureTexts = 0;
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -1695,7 +2606,12 @@ const memoryLanceDBProPlugin = {
             const content = msgObj.content;
 
             if (typeof content === "string") {
-              texts.push(content);
+              const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
+              if (!normalized) {
+                skippedAutoCaptureTexts++;
+              } else {
+                eligibleTexts.push(normalized);
+              }
               continue;
             }
 
@@ -1709,21 +2625,193 @@ const memoryLanceDBProPlugin = {
                   "text" in block &&
                   typeof (block as Record<string, unknown>).text === "string"
                 ) {
-                  texts.push((block as Record<string, unknown>).text as string);
+                  const text = (block as Record<string, unknown>).text as string;
+                  const normalized = normalizeAutoCaptureText(role, text, shouldSkipReflectionMessage);
+                  if (!normalized) {
+                    skippedAutoCaptureTexts++;
+                  } else {
+                    eligibleTexts.push(normalized);
+                  }
                 }
               }
             }
           }
 
-          // Filter for capturable content
-          const toCapture = texts.filter((text) => text && shouldCapture(text));
+          const conversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const pendingIngressTexts = conversationKey
+            ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
+            : [];
+          if (conversationKey) {
+            autoCapturePendingIngressTexts.delete(conversationKey);
+          }
+
+          const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          let newTexts = eligibleTexts;
+          if (pendingIngressTexts.length > 0) {
+            newTexts = pendingIngressTexts;
+          } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
+            newTexts = eligibleTexts.slice(previousSeenCount);
+          }
+          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+
+          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
+          let texts = newTexts;
+          if (
+            texts.length === 1 &&
+            isExplicitRememberCommand(texts[0]) &&
+            priorRecentTexts.length > 0
+          ) {
+            texts = [...priorRecentTexts.slice(-1), ...texts];
+          }
+          if (newTexts.length > 0) {
+            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
+            autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
+            pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
+          const minMessages = config.extractMinMessages ?? 4;
+          if (skippedAutoCaptureTexts > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
+            );
+          }
+          if (pendingIngressTexts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture using ${pendingIngressTexts.length} pending ingress text(s) for agent ${agentId}`,
+            );
+          }
+          if (texts.length !== eligibleTexts.length) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture narrowed ${eligibleTexts.length} eligible history text(s) to ${texts.length} new text(s) for agent ${agentId}`,
+            );
+          }
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture collected ${texts.length} text(s) for agent ${agentId} (minMessages=${minMessages}, smartExtraction=${smartExtractor ? "on" : "off"})`,
+          );
+          if (texts.length === 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture found no eligible texts after filtering for agent ${agentId}`,
+            );
+            return;
+          }
+          if (texts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture text diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+            );
+          }
+
+          // ----------------------------------------------------------------
+          // Feature 7: Skip low-value conversations
+          // ----------------------------------------------------------------
+          if (config.extractionThrottle?.skipLowValue === true) {
+            const conversationValue = estimateConversationValue(texts);
+            if (conversationValue < 0.2) {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture skipped for agent ${agentId} (low conversation value: ${conversationValue.toFixed(2)})`,
+              );
+              return;
+            }
+          }
+
+          // ----------------------------------------------------------------
+          // Feature 1: Session compression — prioritize high-signal texts
+          // ----------------------------------------------------------------
+          if (config.sessionCompression?.enabled === true && texts.length > 0) {
+            const maxChars = config.extractMaxChars ?? 8000;
+            const compressed = compressTexts(texts, maxChars, {
+              minScoreToKeep: config.sessionCompression?.minScoreToKeep,
+            });
+            if (compressed.dropped > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: session compression for agent ${agentId}: dropped ${compressed.dropped}/${texts.length} texts (${compressed.totalChars} chars kept)`,
+              );
+              texts = compressed.texts;
+            }
+          }
+
+          // ----------------------------------------------------------------
+          // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
+          // Rate limiter charged AFTER successful extraction, not before,
+          // so no-op sessions don't consume the hourly quota.
+          // ----------------------------------------------------------------
+          if (smartExtractor) {
+            // Pre-filter: embedding-based noise detection (language-agnostic)
+            const cleanTexts = await smartExtractor.filterNoiseByEmbedding(texts);
+            if (cleanTexts.length === 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: all texts filtered as embedding noise for agent ${agentId}`,
+              );
+              return;
+            }
+            if (cleanTexts.length >= minMessages) {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+              );
+              const conversationText = cleanTexts.join("\n");
+              const stats = await smartExtractor.extractAndPersist(
+                conversationText, sessionKey,
+                { scope: defaultScope, scopeFilter: accessibleScopes },
+              );
+              // Charge rate limiter only after successful extraction
+              extractionRateLimiter.recordExtraction();
+              if (stats.created > 0 || stats.merged > 0) {
+                api.logger.info(
+                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
+                );
+                return; // Smart extraction handled everything
+              }
+
+              if ((stats.boundarySkipped ?? 0) > 0) {
+                api.logger.info(
+                  `memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`,
+                );
+              }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
+              );
+            } else {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
+              );
+            }
+          }
+
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture running regex fallback for agent ${agentId}`,
+          );
+
+          // ----------------------------------------------------------------
+          // Fallback: regex-triggered capture (original logic)
+          // ----------------------------------------------------------------
+          const toCapture = texts.filter((text) => text && shouldCapture(text) && !isNoise(text));
           if (toCapture.length === 0) {
+            if (texts.length > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: regex fallback diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+              );
+            }
+            api.logger.info(
+              `memory-lancedb-pro: regex fallback found 0 capturable texts for agent ${agentId}`,
+            );
             return;
           }
 
-          // Store each capturable piece (limit to 3 per conversation)
+          api.logger.info(
+            `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
+          );
+
+          // Store each capturable piece (limit to 2 per conversation)
           let stored = 0;
-          for (const text of toCapture.slice(0, 3)) {
+          for (const text of toCapture.slice(0, 2)) {
+            if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
+              api.logger.info(
+                `memory-lancedb-pro: skipped USER.md-exclusive auto-capture text for agent ${agentId}`,
+              );
+              continue;
+            }
+
             const category = detectCategory(text);
             const vector = await embedder.embedPassage(text);
 
@@ -1740,7 +2828,7 @@ const memoryLanceDBProPlugin = {
               );
             }
 
-            if (existing.length > 0 && existing[0].score > 0.95) {
+            if (existing.length > 0 && existing[0].score > 0.90) {
               continue;
             }
 
@@ -1750,6 +2838,31 @@ const memoryLanceDBProPlugin = {
               importance: 0.7,
               category,
               scope: defaultScope,
+              metadata: stringifySmartMetadata(
+                buildSmartMetadata(
+                  {
+                    text,
+                    category,
+                    importance: 0.7,
+                  },
+                  {
+                    l0_abstract: text,
+                    l1_overview: `- ${text}`,
+                    l2_content: text,
+                    source_session: (event as any).sessionKey || "unknown",
+                    source: "auto-capture",
+                    // Write "confirmed" so auto-recall governance filter accepts
+                    // these memories immediately. Previously "pending" caused a
+                    // deadlock where auto-captured memories could never be
+                    // auto-recalled (see #350).
+                    state: "confirmed",
+                    memory_layer: "working",
+                    injected_count: 0,
+                    bad_recall_count: 0,
+                    suppressed_until_turn: 0,
+                  },
+                ),
+              ),
             });
             stored++;
 
@@ -1770,7 +2883,12 @@ const memoryLanceDBProPlugin = {
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
         }
-      });
+        })();
+        agentEndAutoCaptureHook.__lastRun = backgroundRun;
+        void backgroundRun;
+      };
+
+      api.on("agent_end", agentEndAutoCaptureHook);
     }
 
     // ========================================================================
@@ -1823,10 +2941,27 @@ const memoryLanceDBProPlugin = {
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
           try {
-            if (!Array.isArray(event.messages)) return;
+            const action = String(event?.action || "unknown");
+            const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
+            const contextForLog = (event?.context && typeof event.context === "object")
+              ? (event.context as Record<string, unknown>)
+              : {};
+            const commandSource = typeof contextForLog.commandSource === "string" ? contextForLog.commandSource : "";
+            const contextKeys = Object.keys(contextForLog).slice(0, 8).join(",");
+            api.logger.info(
+              `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
+            );
+
+            if (!Array.isArray(event.messages)) {
+              api.logger.warn(`self-improvement: command:${action} missing event.messages array; skip note inject`);
+              return;
+            }
 
             const exists = event.messages.some((m: unknown) => typeof m === "string" && m.includes(SELF_IMPROVEMENT_NOTE_PREFIX));
-            if (exists) return;
+            if (exists) {
+              api.logger.info(`self-improvement: command:${action} note already present; skip duplicate inject`);
+              return;
+            }
 
             event.messages.push(
               [
@@ -1834,12 +2969,13 @@ const memoryLanceDBProPlugin = {
                 "- If anything was learned/corrected, log it now:",
                 "  - .learnings/LEARNINGS.md (corrections/best practices)",
                 "  - .learnings/ERRORS.md (failures/root causes)",
-                "  - .learnings/FEATURE_REQUESTS.md (missing capability)",
                 "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
                 "- If reusable across tasks, extract a new skill from the learning.",
-                "- Reflect -> Store -> Inherit -> Derive -> Apply.",
                 "- Then proceed with the new session.",
               ].join("\n")
+            );
+            api.logger.info(
+              `self-improvement: command:${action} injected note; messages=${event.messages.length}`
             );
           } catch (err) {
             api.logger.warn(`self-improvement: note inject failed: ${String(err)}`);
@@ -1874,6 +3010,7 @@ const memoryLanceDBProPlugin = {
       const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
       const reflectionInjectMode = config.memoryReflection?.injectMode ?? "inheritance+derived";
       const reflectionStoreToLanceDB = config.memoryReflection?.storeToLanceDB !== false;
+      const reflectionWriteLegacyCombined = config.memoryReflection?.writeLegacyCombined !== false;
       const warnedInvalidReflectionAgentIds = new Set<string>();
 
       const resolveReflectionRunAgentId = (cfg: unknown, sourceAgentId: string): string => {
@@ -1890,7 +3027,7 @@ const memoryLanceDBProPlugin = {
         return sourceAgentId;
       };
 
-      api.on("after_tool_call", (event, ctx) => {
+      api.on("after_tool_call", (event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (!sessionKey) return;
@@ -1926,14 +3063,17 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 15 });
 
-      api.on("before_agent_start", async (_event, ctx) => {
+      api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
           pruneReflectionSessionState();
-          const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
-          const scopes = scopeManager.getAccessibleScopes(agentId);
+          const agentId = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
           const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
@@ -1950,16 +3090,19 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 12 });
 
-      api.on("before_prompt_build", async (_event, ctx) => {
+      api.on("before_prompt_build", async (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
-        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
+        const agentId = resolveHookAgentId(
+          typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+          sessionKey,
+        );
         pruneReflectionSessionState();
 
         const blocks: string[] = [];
         if (reflectionInjectMode === "inheritance+derived") {
           try {
-            const scopes = scopeManager.getAccessibleScopes(agentId);
+            const scopes = resolveScopeFilter(scopeManager, agentId);
             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
             const derivedLines = derivedCache?.derived?.length
               ? derivedCache.derived
@@ -1968,7 +3111,7 @@ const memoryLanceDBProPlugin = {
               blocks.push(
                 [
                   "<derived-focus>",
-                  "Latest derived execution deltas from reflection memory:",
+                  "Weighted recent derived execution deltas from reflection memory:",
                   ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
                   "</derived-focus>",
                 ].join("\n")
@@ -1998,7 +3141,7 @@ const memoryLanceDBProPlugin = {
         return { prependContext: blocks.join("\n\n") };
       }, { priority: 15 });
 
-      api.on("session_end", (_event, ctx) => {
+      api.on("session_end", (_event: any, ctx: any) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey.trim() : "";
         if (!sessionKey) return;
         reflectionErrorStateBySession.delete(sessionKey);
@@ -2010,15 +3153,23 @@ const memoryLanceDBProPlugin = {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         try {
           pruneReflectionSessionState();
+          const action = String(event?.action || "unknown");
           const context = (event.context || {}) as Record<string, unknown>;
           const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
-          if (!cfg) return;
+          if (!cfg) {
+            api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
+            return;
+          }
 
           const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
+          api.logger.info(
+            `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
+          );
 
           if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
             const searchDirs = resolveReflectionSessionSearchDirs({
@@ -2028,19 +3179,42 @@ const memoryLanceDBProPlugin = {
               currentSessionFile,
               sourceAgentId,
             });
+            api.logger.info(
+              `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+            );
             for (const sessionsDir of searchDirs) {
               const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
               if (recovered) {
+                api.logger.info(
+                  `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
+                );
                 currentSessionFile = recovered;
                 break;
               }
             }
           }
 
-          if (!currentSessionFile) return;
+          if (!currentSessionFile) {
+            const searchDirs = resolveReflectionSessionSearchDirs({
+              context,
+              cfg,
+              workspaceDir,
+              currentSessionFile,
+              sourceAgentId,
+            });
+            api.logger.warn(
+              `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
+            );
+            return;
+          }
 
           const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
-          if (!conversation) return;
+          if (!conversation) {
+            api.logger.warn(
+              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`
+            );
+            return;
+          }
 
           const now = new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now());
           const nowTs = now.getTime();
@@ -2049,11 +3223,16 @@ const memoryLanceDBProPlugin = {
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-          const targetScope = scopeManager.getDefaultScope(sourceAgentId);
+          const targetScope = isSystemBypassId(sourceAgentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(sourceAgentId);
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
 
+          api.logger.info(
+            `memory-reflection: command:${action} reflection generation start for session ${currentSessionId}; timeoutMs=${reflectionTimeoutMs}`
+          );
           const reflectionGenerated = await generateReflectionText({
             conversation,
             maxInputChars: reflectionMaxInputChars,
@@ -2065,6 +3244,9 @@ const memoryLanceDBProPlugin = {
             toolErrorSignals,
             logger: api.logger,
           });
+          api.logger.info(
+            `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
+          );
           const reflectionText = reflectionGenerated.text;
           if (reflectionGenerated.runner === "cli") {
             api.logger.warn(
@@ -2114,7 +3296,79 @@ const memoryLanceDBProPlugin = {
             throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
           }
 
-          if (reflectionStoreToLanceDB && !reflectionGenerated.usedFallback) {
+          const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+          if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
+            for (const candidate of reflectionGovernanceCandidates) {
+              await appendSelfImprovementEntry({
+                baseDir: workspaceDir,
+                type: "learning",
+                summary: candidate.summary,
+                details: candidate.details,
+                suggestedAction: candidate.suggestedAction,
+                category: "best_practice",
+                area: candidate.area || "config",
+                priority: candidate.priority || "medium",
+                status: candidate.status || "pending",
+                source: `memory-lancedb-pro/reflection:${relPath}`,
+              });
+            }
+          }
+
+          const reflectionEventId = createReflectionEventId({
+            runAt: nowTs,
+            sessionKey,
+            sessionId: currentSessionId || "unknown",
+            agentId: sourceAgentId,
+            command: String(event.action || "unknown"),
+          });
+
+          const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
+          for (const mapped of mappedReflectionMemories) {
+            const vector = await embedder.embedPassage(mapped.text);
+            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-reflection: mapped memory duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (existing.length > 0 && existing[0].score > 0.95) {
+              continue;
+            }
+
+            const importance = mapped.category === "decision" ? 0.85 : 0.8;
+            const metadata = JSON.stringify(buildReflectionMappedMetadata({
+              mappedItem: mapped,
+              eventId: reflectionEventId,
+              agentId: sourceAgentId,
+              sessionKey,
+              sessionId: currentSessionId || "unknown",
+              runAt: nowTs,
+              usedFallback: reflectionGenerated.usedFallback,
+              toolErrorSignals,
+              sourceReflectionPath: relPath,
+            }));
+
+            const storedEntry = await store.store({
+              text: mapped.text,
+              vector,
+              importance,
+              category: mapped.category,
+              scope: targetScope,
+              metadata,
+            });
+
+            if (mdMirror) {
+              await mdMirror(
+                { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
+                { source: `reflection:${mapped.heading}`, agentId: sourceAgentId },
+              );
+            }
+          }
+
+          if (reflectionStoreToLanceDB) {
             const stored = await storeReflectionToLanceDB({
               reflectionText,
               sessionKey,
@@ -2125,6 +3379,13 @@ const memoryLanceDBProPlugin = {
               toolErrorSignals,
               runAt: nowTs,
               usedFallback: reflectionGenerated.usedFallback,
+              eventId: reflectionEventId,
+              sourceReflectionPath: relPath,
+              writeLegacyCombined: reflectionWriteLegacyCombined,
+              embedPassage: (text) => embedder.embedPassage(text),
+              vectorSearch: (vector, limit, minScore, scopeFilter) =>
+                store.vectorSearch(vector, limit, minScore, scopeFilter),
+              store: (entry) => store.store(entry),
             });
             if (sessionKey && stored.slices.derived.length > 0) {
               reflectionDerivedBySession.set(sessionKey, {
@@ -2162,11 +3423,114 @@ const memoryLanceDBProPlugin = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
       });
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
+      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build, session_end)");
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
-      api.logger.info("session-strategy: using systemSessionMemory (plugin memory-reflection hooks disabled)");
+      const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+
+      const storeSystemSessionSummary = async (params: {
+        agentId: string;
+        defaultScope: string;
+        sessionKey: string;
+        sessionId: string;
+        source: string;
+        sessionContent: string;
+        timestampMs?: number;
+      }) => {
+        const now = new Date(params.timestampMs ?? Date.now());
+        const dateStr = now.toISOString().split("T")[0];
+        const timeStr = now.toISOString().split("T")[1].split(".")[0];
+        const memoryText = [
+          `Session: ${dateStr} ${timeStr} UTC`,
+          `Session Key: ${params.sessionKey}`,
+          `Session ID: ${params.sessionId}`,
+          `Source: ${params.source}`,
+          "",
+          "Conversation Summary:",
+          params.sessionContent,
+        ].join("\n");
+
+        const vector = await embedder.embedPassage(memoryText);
+        await store.store({
+          text: memoryText,
+          vector,
+          category: "fact",
+          scope: params.defaultScope,
+          importance: 0.5,
+          metadata: stringifySmartMetadata(
+            buildSmartMetadata(
+              {
+                text: `Session summary for ${dateStr}`,
+                category: "fact",
+                importance: 0.5,
+                timestamp: Date.now(),
+              },
+              {
+                l0_abstract: `Session summary for ${dateStr}`,
+                l1_overview: `- Session summary saved for ${params.sessionId}`,
+                l2_content: memoryText,
+                memory_category: "patterns",
+                tier: "peripheral",
+                confidence: 0.5,
+                type: "session-summary",
+                sessionKey: params.sessionKey,
+                sessionId: params.sessionId,
+                date: dateStr,
+                agentId: params.agentId,
+                scope: params.defaultScope,
+              },
+            ),
+          ),
+        });
+
+        api.logger.info(
+          `session-memory: stored session summary for ${params.sessionId} (agent: ${params.agentId}, scope: ${params.defaultScope})`
+        );
+      };
+
+      api.on("before_reset", async (event, ctx) => {
+        if (event.reason !== "new") return;
+
+        try {
+          const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+          const agentId = resolveHookAgentId(
+            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
+            sessionKey,
+          );
+          const defaultScope = isSystemBypassId(agentId)
+            ? config.scopes?.default ?? "global"
+            : scopeManager.getDefaultScope(agentId);
+          const currentSessionId =
+            typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
+              ? ctx.sessionId
+              : "unknown";
+          const source = resolveSourceFromSessionKey(sessionKey);
+          const sessionContent =
+            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+            (typeof event.sessionFile === "string"
+              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+              : null);
+
+          if (!sessionContent) {
+            api.logger.debug("session-memory: no session content found, skipping");
+            return;
+          }
+
+          await storeSystemSessionSummary({
+            agentId,
+            defaultScope,
+            sessionKey,
+            sessionId: currentSessionId,
+            source,
+            sessionContent,
+          });
+        } catch (err) {
+          api.logger.warn(`session-memory: failed to save: ${String(err)}`);
+        }
+      });
+
+      api.logger.info("session-memory: typed before_reset hook registered for /new session summaries");
     }
     if (config.sessionStrategy === "none") {
       api.logger.info("session-strategy: using none (plugin memory-reflection hooks disabled)");
@@ -2213,7 +3577,7 @@ const memoryLanceDBProPlugin = {
         if (files.length > 7) {
           const { unlink } = await import("node:fs/promises");
           for (const old of files.slice(0, files.length - 7)) {
-            await unlink(join(backupDir, old)).catch(() => {});
+            await unlink(join(backupDir, old)).catch(() => { });
           }
         }
 
@@ -2271,10 +3635,10 @@ const memoryLanceDBProPlugin = {
 
             api.logger.info(
               `memory-lancedb-pro: initialized successfully ` +
-                `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
-                `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-                `mode: ${retrievalTest.mode}, ` +
-                `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
+              `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
+              `mode: ${retrievalTest.mode}, ` +
+              `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
             );
 
             if (!embedTest.success) {
@@ -2297,19 +3661,27 @@ const memoryLanceDBProPlugin = {
         // Fire-and-forget: allow gateway to start serving immediately.
         setTimeout(() => void runStartupChecks(), 0);
 
+        // Check for legacy memories that could be upgraded
+        setTimeout(async () => {
+          try {
+            const upgrader = createMemoryUpgrader(store, null);
+            const counts = await upgrader.countLegacy();
+            if (counts.legacy > 0) {
+              api.logger.info(
+                `memory-lancedb-pro: found ${counts.legacy} legacy memories (of ${counts.total} total) that can be upgraded to the new smart memory format. ` +
+                `Run 'openclaw memory-pro upgrade' to convert them.`
+              );
+            }
+          } catch {
+            // Non-critical: silently ignore
+          }
+        }, 5_000);
+
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
       },
       stop: async () => {
-        // Flush pending access reinforcement data before shutdown
-        try {
-          await accessTracker.flush();
-        } catch (err) {
-          api.logger.warn("memory-lancedb-pro: flush failed on stop:", err);
-        }
-        accessTracker.destroy();
-
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
@@ -2363,6 +3735,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const sessionMemoryRaw = typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
     ? cfg.sessionMemory as Record<string, unknown>
     : null;
+  const workspaceBoundaryRaw = typeof cfg.workspaceBoundary === "object" && cfg.workspaceBoundary !== null
+    ? cfg.workspaceBoundary as Record<string, unknown>
+    : null;
+  const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
+    ? workspaceBoundaryRaw.userMdExclusive as Record<string, unknown>
+    : null;
   const sessionStrategyRaw = cfg.sessionStrategy;
   const legacySessionMemoryEnabled = typeof sessionMemoryRaw?.enabled === "boolean"
     ? sessionMemoryRaw.enabled
@@ -2372,9 +3750,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? sessionStrategyRaw
       : legacySessionMemoryEnabled === true
         ? "systemSessionMemory"
-      : legacySessionMemoryEnabled === false
-          ? "none"
-      : "systemSessionMemory";
+        : "none";
   const reflectionMessageCount = parsePositiveInt(memoryReflectionRaw?.messageCount ?? sessionMemoryRaw?.messageCount) ?? DEFAULT_REFLECTION_MESSAGE_COUNT;
   const injectModeRaw = memoryReflectionRaw?.injectMode;
   const reflectionInjectMode: ReflectionInjectMode =
@@ -2400,6 +3776,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       // Accept number, numeric string, or env-var string (e.g. "${EMBED_DIM}").
       // Also accept legacy top-level `dimensions` for convenience.
       dimensions: parsePositiveInt(embedding.dimensions ?? cfg.dimensions),
+      omitDimensions:
+        typeof embedding.omitDimensions === "boolean"
+          ? embedding.omitDimensions
+          : undefined,
       taskQuery:
         typeof embedding.taskQuery === "string"
           ? embedding.taskQuery
@@ -2412,22 +3792,31 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         typeof embedding.normalized === "boolean"
           ? embedding.normalized
           : undefined,
+      chunking:
+        typeof embedding.chunking === "boolean"
+          ? embedding.chunking
+          : undefined,
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
     // Default OFF: only enable when explicitly set to true.
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
-    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
+    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
+    autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
+    autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
+    maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     captureAssistant: cfg.captureAssistant === true,
-    retrieval:
-      typeof cfg.retrieval === "object" && cfg.retrieval !== null
-        ? (cfg.retrieval as any)
-        : undefined,
-    scopes:
-      typeof cfg.scopes === "object" && cfg.scopes !== null
-        ? (cfg.scopes as any)
-        : undefined,
+    retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
+    decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
+    tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
+    // Smart extraction config (Phase 1)
+    smartExtraction: cfg.smartExtraction !== false, // Default ON
+    llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
+    extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
+    scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
     sessionStrategy,
     selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
@@ -2447,6 +3836,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
+        writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined !== false,
         injectMode: reflectionInjectMode,
         agentId: asNonEmptyString(memoryReflectionRaw.agentId),
         messageCount: reflectionMessageCount,
@@ -2463,6 +3853,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       : {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
+        writeLegacyCombined: true,
         injectMode: "inheritance+derived",
         agentId: undefined,
         messageCount: reflectionMessageCount,
@@ -2475,27 +3866,82 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
         ? {
-            enabled:
-              (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
-            messageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .messageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .messageCount as number)
-                : undefined,
-          }
+          enabled:
+            (cfg.sessionMemory as Record<string, unknown>).enabled === true,
+          messageCount:
+            typeof (cfg.sessionMemory as Record<string, unknown>)
+              .messageCount === "number"
+              ? ((cfg.sessionMemory as Record<string, unknown>)
+                .messageCount as number)
+              : undefined,
+        }
         : undefined,
     mdMirror:
       typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
         ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
+          enabled:
+            (cfg.mdMirror as Record<string, unknown>).enabled === true,
+          dir:
+            typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+              ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+              : undefined,
+        }
         : undefined,
+    workspaceBoundary:
+      workspaceBoundaryRaw
+        ? {
+          userMdExclusive: userMdExclusiveRaw
+            ? {
+              enabled: userMdExclusiveRaw.enabled === true,
+              routeProfile: userMdExclusiveRaw.routeProfile !== false,
+              routeCanonicalName: userMdExclusiveRaw.routeCanonicalName !== false,
+              routeCanonicalAddressing: userMdExclusiveRaw.routeCanonicalAddressing !== false,
+              filterRecall: userMdExclusiveRaw.filterRecall !== false,
+            }
+            : undefined,
+        }
+        : undefined,
+    admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+    memoryCompaction: (() => {
+      const raw =
+        typeof cfg.memoryCompaction === "object" && cfg.memoryCompaction !== null
+          ? (cfg.memoryCompaction as Record<string, unknown>)
+          : null;
+      if (!raw) return undefined;
+      return {
+        enabled: raw.enabled === true,
+        minAgeDays: parsePositiveInt(raw.minAgeDays) ?? 7,
+        similarityThreshold:
+          typeof raw.similarityThreshold === "number"
+            ? Math.max(0, Math.min(1, raw.similarityThreshold))
+            : 0.88,
+        minClusterSize: parsePositiveInt(raw.minClusterSize) ?? 2,
+        maxMemoriesToScan: parsePositiveInt(raw.maxMemoriesToScan) ?? 200,
+        cooldownHours: parsePositiveInt(raw.cooldownHours) ?? 24,
+      };
+    })(),
+    sessionCompression:
+      typeof cfg.sessionCompression === "object" && cfg.sessionCompression !== null
+        ? {
+            enabled:
+              (cfg.sessionCompression as Record<string, unknown>).enabled === true,
+            minScoreToKeep:
+              typeof (cfg.sessionCompression as Record<string, unknown>).minScoreToKeep === "number"
+                ? ((cfg.sessionCompression as Record<string, unknown>).minScoreToKeep as number)
+                : 0.3,
+          }
+        : { enabled: false, minScoreToKeep: 0.3 },
+    extractionThrottle:
+      typeof cfg.extractionThrottle === "object" && cfg.extractionThrottle !== null
+        ? {
+            skipLowValue:
+              (cfg.extractionThrottle as Record<string, unknown>).skipLowValue === true,
+            maxExtractionsPerHour:
+              typeof (cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour === "number"
+                ? ((cfg.extractionThrottle as Record<string, unknown>).maxExtractionsPerHour as number)
+                : 30,
+          }
+        : { skipLowValue: false, maxExtractionsPerHour: 30 },
   };
 }
 
